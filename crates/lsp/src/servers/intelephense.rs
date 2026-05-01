@@ -1,5 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "local_fs")]
+use std::time::Duration;
 
 use crate::language_server_candidate::{LanguageServerCandidate, LanguageServerMetadata};
 #[cfg(feature = "local_fs")]
@@ -9,6 +11,16 @@ use async_trait::async_trait;
 
 #[cfg(feature = "local_fs")]
 use anyhow::Context;
+#[cfg(feature = "local_fs")]
+use warpui::r#async::FutureExt as _;
+
+/// Upper bound on how long we're willing to wait for `intelephense --stdio`
+/// to acknowledge stdin EOF and exit. A healthy install exits within tens
+/// of milliseconds; capping the probe at 3s prevents a broken npm shim
+/// (or a Node binary that mis-handles a closed stdin) from leaving install
+/// detection blocked forever and lets the data_dir fallback take over.
+#[cfg(feature = "local_fs")]
+const INSTALL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Language server candidate for [Intelephense](https://intelephense.com/),
 /// the de-facto standard PHP language server (used by Zed, VS Code, Neovim,
@@ -104,17 +116,33 @@ impl LanguageServerCandidate for IntelephenseCandidate {
         // exits cleanly when the install is healthy. We require both the
         // file to be present *and* the spawn to exit with success status,
         // so a broken global shim never displaces Warp's data_dir copy.
+        //
+        // The spawn is bounded by `INSTALL_PROBE_TIMEOUT`. `--stdio` is a
+        // long-running transport mode; a broken shim that fails to ack
+        // stdin EOF would otherwise hang install detection indefinitely
+        // and prevent the data_dir fallback from running. Treat any
+        // timeout as "not a working PATH install" so the custom install
+        // takes over.
         if !binary_in_path("intelephense", executor.path_env_var()) {
             return false;
         }
-        executor
+        let probe = executor
             .command("intelephense")
             .arg("--stdio")
             .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+            .output();
+        match probe.with_timeout(INSTALL_PROBE_TIMEOUT).await {
+            Ok(Ok(output)) => output.status.success(),
+            Ok(Err(_io_err)) => false,
+            Err(_timeout) => {
+                log::debug!(
+                    "intelephense PATH probe timed out after {:?}; \
+                     treating as unavailable so the data_dir install can be used.",
+                    INSTALL_PROBE_TIMEOUT,
+                );
+                false
+            }
+        }
     }
 
     async fn install(
