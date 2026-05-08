@@ -34,7 +34,7 @@ interacts with filtering.
 - No server-side admin bulk tools.
 - No in-app undo window for Plan deletion (Plans are higher-stakes than chat
   history; undo is intentionally NOT mirrored from #10457).
-- The single-item behaviors of **open, run, and share** are unchanged in V1 (open via `Enter`/double-click, run via existing run affordance, share via existing share affordance). The plain-click selection contract in B1 (which gives plain click a side effect — clearing prior multi-selection and setting the anchor) is **not** considered a change to the prior single-item behavior of open/run/share, because plain click was already a selection gesture that focused/selected the row; B1 only formalizes the anchor side of that gesture for use by Shift-extension. Plain click does not trigger open/run/share.
+- The single-item behaviors of **open, run, and share** are unchanged in V1 (open via `Enter`/double-click, run via existing run affordance, share via existing share affordance). Plain click does not trigger open/run/share. See B1 below for the **explicit, authoritative reconciliation** between plain click's existing single-row selection effect and the new anchor-setting effect; if the prose under Non-Goals here ever appears to conflict with B1, B1 wins.
 - Not the same flow as PR #10457 (chat history bulk delete) — Drive selection
   is its own model.
 
@@ -42,8 +42,40 @@ interacts with filtering.
 
 ### B1. Single-click selects one row
 
-A plain click on a row clears any existing multi-selection and selects that
-one row. The clicked row becomes the new "anchor" for future Shift extension.
+**Authoritative plain-click contract.** A plain (unmodified) left click on a
+Drive row does the following, in order, and nothing else:
+
+1. Clears any existing multi-selection (i.e., the selection set is reset to
+   contain only the clicked row).
+2. Sets the clicked row as the single-row selection.
+3. Sets the clicked row as the new "anchor" for future Shift extension.
+4. Does **not** open the item.
+5. Does **not** run the item.
+6. Does **not** share the item.
+7. Does **not** show the selection bar (size = 1; the bar requires ≥2 per B6).
+
+**Reconciliation with prior single-row behavior.** Pre-V1 Drive already
+treated plain click as a selection-and-focus gesture on the row (the row
+became visually selected and arrow-key navigation continued from there).
+V1 does **not** change what plain click does to the visible selection state
+of a single row — the row is still selected and focused exactly as before.
+V1 only adds two non-visible side effects on the same gesture:
+
+- (a) Any rows that were members of a prior multi-selection set are now
+  removed from the set. (Pre-V1 there was no multi-selection set, so this
+  side effect had nothing to clear.)
+- (b) The clicked row is recorded as the anchor for use by subsequent
+  Shift-click and Shift+Arrow extension.
+
+Both (a) and (b) are non-visible internal-state effects only. Plain click
+does **not** trigger open, run, or share — those continue to use their
+pre-V1 affordances (Enter / double-click / explicit run / explicit share
+buttons). Therefore, from the user's standpoint, plain click on a row
+behaves identically to pre-V1 except that prior multi-selection is cleared
+(which only matters when the user has built a multi-selection in this
+session). This is the single authoritative contract for plain click;
+any earlier or later prose that appears to disagree is superseded by this
+section.
 
 ### B2. Cmd/Ctrl-click toggles a single row
 
@@ -64,11 +96,20 @@ no prior anchor sets the anchor to the clicked row.
 visible filtered set. With no filter active, it selects everything in the
 current Drive view.
 
-**Focus scoping (REQUIRED).** All selection-related shortcuts in this spec
+**Focus scoping (REQUIRED — load-bearing for `Cmd/Ctrl+A`).** All
+selection-related shortcuts in this spec
 (`Cmd/Ctrl+A`, `Esc`, `Space`, `Enter`, `Up`/`Down`, `Shift+Up`/`Shift+Down`,
 plain/Shift/Cmd-Ctrl click handlers) only fire when **the Drive row list
-itself owns keyboard focus**. They do **not** intercept input when focus is
-inside any text-input surface within the Drive panel — specifically:
+itself owns keyboard focus**. The single most important consequence is
+that **`Cmd/Ctrl+A` MUST NOT hijack the user's text selection** while
+focus is inside the filter / search input or any other text input within
+the Drive panel — when focus is inside a text input, `Cmd/Ctrl+A` falls
+through to the platform-native "select all text" behavior on that input.
+Implementations that route `Cmd/Ctrl+A` to row selection while a text
+input owns focus are **non-conforming**.
+
+The shortcuts do **not** intercept input when focus is inside any
+text-input surface within the Drive panel — specifically:
 
 - The filter / search input at the top of Drive.
 - The folder name input inside the Move-to picker.
@@ -101,9 +142,22 @@ apply (no bulk bar).
 
 ### B7. Bulk Delete
 
-Triggered from the selection bar Delete action. Shows a modal whose copy
-depends on whether the current selection includes items hidden by an active
-filter:
+Triggered from the selection bar Delete action.
+
+**Hidden-selection authoritative rule (load-bearing).** Bulk Delete
+**MUST NOT** proceed when the selection contains items hidden by the
+active filter without first showing the user (a) the total count being
+deleted, (b) the visible/hidden breakdown, and (c) a `[Show hidden]`
+affordance to inspect the hidden subset before confirming. Suppressing,
+re-using, or short-circuiting this confirmation — even after the user
+previously dismissed a similar modal in the same session — is
+**non-conforming**. This rule exists because the visible row list
+materially understates the destructive scope when a filter is active;
+the confirmation modal is the *only* moment the user can audit the true
+scope. The exact copy and affordances per scenario are defined below.
+
+The modal copy depends on whether the current selection includes items
+hidden by an active filter:
 
 - **All selected are visible (hidden count = 0):**
   `Delete <N> items? This cannot be undone.` `[Delete] [Cancel]`
@@ -201,12 +255,18 @@ No new user-facing settings. Internal additions:
 
 - `WarpDriveSelection` model holding `{ anchor: Option<RowId>, set: HashSet<RowId> }`.
 
-### Server-side authorization (REQUIRED for bulk paths)
+### Server-side authorization and bounded work (REQUIRED for bulk paths)
 
-Both bulk delete and bulk move — whether they land on a new server-side
-batch endpoint or on the existing per-item endpoints in a loop — MUST
-preserve the per-item authorization and ownership checks already enforced
-by the single-item endpoints. Specifically:
+**Scope.** This section applies equally to (a) a new server-side batch
+endpoint, if introduced, and (b) the existing per-item endpoints invoked
+in a loop. There is no path — neither client-fanout nor batch — by which
+bulk operations may bypass the rules below.
+
+**Item-level authorization (REQUIRED).** Bulk delete and bulk move MUST
+preserve the per-item authorization and ownership checks already
+enforced by the single-item endpoints. A batch endpoint that "trusts the
+batch" (i.e., authorizes once per request and then operates on every id)
+is **non-conforming**. Specifically:
 
 - **Per-item auth check.** For each item id in the request, the server
   re-runs the same ownership / team-membership / role check that the
@@ -244,8 +304,30 @@ just a chunk size:
 | Backoff | on `429` or `5xx`, exponential backoff with jitter starting at 250ms, max 4 retries per id | Standard polite-client pattern. |
 | Cancellation | the operation is cancellable from the result toast and from `Esc` in the progress indicator; in-flight ids complete; queued ids are dropped | User remains in control. |
 
+**Bounded total work (applies to BOTH paths).** The 2000-item hard cap,
+4-concurrent-in-flight limit, 20 req/s rate cap, and exponential backoff
+defined above are NOT specific to the per-item fallback. They are
+hard caps on **total bulk-action server work**, applied identically when
+a batch endpoint is used:
+
+- The total selection size cap of 2000 applies to the batch payload as
+  well — a batch request with >2000 ids is refused client-side BEFORE
+  hitting the wire and is also rejected server-side as a defense-in-depth.
+- When a batch endpoint accepts up to 200 ids per call, the same 4-way
+  concurrency and 20 req/s sustained-rate caps apply to the *batched*
+  call sequence (so the maximum theoretical throughput is identical to
+  the per-item path: bounded concurrency × bounded rate).
+- Backoff on `429` / `5xx` applies to the batch request as a whole and
+  retries the entire chunk's ids that have not yet succeeded server-side.
+- The cancellation contract from the table applies in both paths: in
+  flight requests complete, queued chunks are dropped, and partially
+  succeeded ids are surfaced in the result toast.
+
 A server-side batch endpoint, when available, supersedes the per-item
-loop but MUST still enforce the per-item authorization rules above.
+loop for wire efficiency but MUST still enforce both the per-item
+authorization rules and the total-work caps above. Chunking alone is
+**not** sufficient; the work caps are an independent, additive
+constraint.
 
 ## Acceptance Criteria
 
