@@ -77,8 +77,28 @@ apply (no bulk bar).
 
 ### B7. Bulk Delete
 
-Triggered from the selection bar Delete action. Shows a modal:
-`Delete <N> items? This cannot be undone.` `[Delete] [Cancel]`.
+Triggered from the selection bar Delete action. Shows a modal whose copy
+depends on whether the current selection includes items hidden by an active
+filter:
+
+- **All selected are visible (hidden count = 0):**
+  `Delete <N> items? This cannot be undone.` `[Delete] [Cancel]`
+- **Some selected are hidden by filter (visible > 0, hidden > 0):**
+  `Delete <total> items, including <hidden> not currently visible due to
+  filter? This cannot be undone.` followed by an explicit count breakdown
+  on its own line: `(<visible> visible, <hidden> hidden by filter)`.
+  `[Delete] [Show hidden] [Cancel]`
+- **All selected are hidden (visible = 0, hidden > 0):**
+  `All <hidden> selected items are hidden by the current filter. Delete
+  anyway? This cannot be undone.` `[Delete] [Show hidden] [Cancel]`
+
+The `[Show hidden]` action opens a secondary modal listing the names of every
+selected item (visible and hidden), with the hidden subset visually flagged
+(e.g. a "hidden by filter" tag). The user MAY deselect individual items from
+this secondary view; deselections take effect on dismissal and the primary
+confirmation is re-rendered with updated counts.
+
+Other Bulk Delete behavior:
 
 - No 5-second undo window (deliberately differs from chat-history bulk delete).
 - Per-item failures are collected and surfaced in a result toast:
@@ -86,10 +106,29 @@ Triggered from the selection bar Delete action. Shows a modal:
 - Recommendation in Open Questions: server-side soft tombstone for 30 days
   is a separate decision.
 
+#### B7.1. Hidden-selection invariant (security / safety)
+
+Bulk destructive operations on selections that include items hidden by an
+active filter MUST display the hidden count in the confirmation. Implementations
+MUST NOT proceed with a bulk delete when `hidden_count > 0` without first
+showing the breakdown defined above. Skipping the breakdown — even when the
+user has previously dismissed it for the same selection — is non-conforming.
+
+This invariant exists because the visual list does NOT reflect the true scope
+of the destructive action when a filter is active; the confirmation is the
+sole moment the user can audit what they are about to delete.
+
 ### B8. Bulk Move to folder
 
 Triggered from the selection bar Move to… action. Opens the existing folder
-picker. Moves all selected items to the chosen folder.
+picker.
+
+When the current selection includes items hidden by filter, the folder picker
+header MUST display the same count breakdown wording used in B7
+(`Move <total> items, including <hidden> not currently visible due to filter`
+plus `(<visible> visible, <hidden> hidden by filter)`) and offer the same
+`[Show hidden]` affordance. Move is less destructive than Delete but must
+still surface the scope.
 
 - Items already in the destination folder are a silent no-op (not an error).
 - Mixed-type selections are allowed; folder picker is the same.
@@ -100,7 +139,8 @@ Items selected before a filter/search narrows the visible set REMAIN
 selected even when filtered out of view. The selection bar shows
 `<visible> + <hidden> selected` so the user can see the hidden count and
 decide whether to clear before acting. Bulk actions still apply to all
-selected items, visible or not.
+selected items, visible or not, subject to the B7 / B8 confirmation
+requirements.
 
 ### B10. Keyboard navigation
 
@@ -132,7 +172,25 @@ No new user-facing settings. Internal additions:
 - A5: Selection bar appears when selection is ≥2 and disappears at 0 or 1.
 - A6: Bulk delete shows the confirm modal and removes all selected items;
   per-item failures surface in a result toast.
+- A6a: When all selected items are visible, bulk-delete confirmation reads
+  `Delete <N> items? This cannot be undone.` with no breakdown line.
+- A6b: When some selected items are hidden by filter, bulk-delete confirmation
+  reads `Delete <total> items, including <hidden> not currently visible due
+  to filter? This cannot be undone.` AND displays the breakdown line
+  `(<visible> visible, <hidden> hidden by filter)`. The dialog MUST expose a
+  `[Show hidden]` action.
+- A6c: When ALL selected items are hidden (visible = 0), bulk-delete
+  confirmation reads `All <hidden> selected items are hidden by the current
+  filter. Delete anyway? This cannot be undone.` and exposes `[Show hidden]`.
+- A6d: `[Show hidden]` opens a secondary view listing names of every selected
+  item, with hidden items flagged. The user can deselect individual items
+  from this view; on dismissal the primary confirmation re-renders with
+  updated counts.
+- A6e: Implementations MUST NOT proceed with bulk delete when `hidden_count > 0`
+  without first showing the breakdown defined above (B7.1 invariant).
 - A7: Bulk move opens the folder picker and moves all selected items.
+- A7a: When the move selection includes hidden items, the folder picker
+  header surfaces the same count breakdown and `[Show hidden]` affordance.
 - A8: Selection persists when the user types into the filter / clears the
   filter.
 - A9: Keyboard navigation full path: arrow movement, `Shift+Arrow` extension,
@@ -177,6 +235,28 @@ Likely change shape:
 - T5: `Esc` clears selection and dismisses the selection bar.
 - T6: Selection bar appears at 2 selected, disappears at 1 and at 0.
 - T7: Bulk delete with a partial-failure mock surfaces the failed items.
+- T_confirm_visible_only: With no filter active (or filter active but
+  hidden_count = 0), the bulk-delete confirmation reads
+  `Delete <N> items? This cannot be undone.` and does NOT include a
+  breakdown line.
+- T_confirm_with_hidden: With a filter active and hidden_count > 0 (and
+  visible_count > 0), the confirmation reads
+  `Delete <total> items, including <hidden> not currently visible due to
+  filter? This cannot be undone.` and includes a breakdown line of the form
+  `(<visible> visible, <hidden> hidden by filter)`.
+- T_confirm_all_hidden: With visible_count = 0 and hidden_count > 0, the
+  confirmation reads `All <hidden> selected items are hidden by the current
+  filter. Delete anyway? This cannot be undone.`
+- T_show_hidden_button: Clicking `[Show hidden]` opens a secondary view
+  listing the names of every selected item, with hidden items visually
+  flagged.
+- T_deselect_from_hidden_view: From the secondary view the user can
+  deselect individual items; on dismissal the primary confirmation
+  re-renders with updated counts (and reverts to the no-hidden wording if
+  the deselections eliminate the hidden subset).
+- T_move_with_hidden: Bulk Move with hidden_count > 0 surfaces the same
+  count breakdown and `[Show hidden]` affordance in the folder picker
+  header.
 - T8: Bulk move into an existing folder; items already in destination are
   silent no-ops.
 - T9: Selection persists after typing into the filter and after clearing it.
