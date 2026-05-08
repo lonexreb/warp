@@ -34,7 +34,7 @@ interacts with filtering.
 - No server-side admin bulk tools.
 - No in-app undo window for Plan deletion (Plans are higher-stakes than chat
   history; undo is intentionally NOT mirrored from #10457).
-- No change to single-item behavior (open, run, share) at all.
+- The single-item behaviors of **open, run, and share** are unchanged in V1 (open via `Enter`/double-click, run via existing run affordance, share via existing share affordance). The plain-click selection contract in B1 (which gives plain click a side effect — clearing prior multi-selection and setting the anchor) is **not** considered a change to the prior single-item behavior of open/run/share, because plain click was already a selection gesture that focused/selected the row; B1 only formalizes the anchor side of that gesture for use by Shift-extension. Plain click does not trigger open/run/share.
 - Not the same flow as PR #10457 (chat history bulk delete) — Drive selection
   is its own model.
 
@@ -63,6 +63,30 @@ no prior anchor sets the anchor to the clicked row.
 `Cmd+A` (mac) / `Ctrl+A` (win/linux) selects every row in the currently
 visible filtered set. With no filter active, it selects everything in the
 current Drive view.
+
+**Focus scoping (REQUIRED).** All selection-related shortcuts in this spec
+(`Cmd/Ctrl+A`, `Esc`, `Space`, `Enter`, `Up`/`Down`, `Shift+Up`/`Shift+Down`,
+plain/Shift/Cmd-Ctrl click handlers) only fire when **the Drive row list
+itself owns keyboard focus**. They do **not** intercept input when focus is
+inside any text-input surface within the Drive panel — specifically:
+
+- The filter / search input at the top of Drive.
+- The folder name input inside the Move-to picker.
+- Any inline rename affordance.
+- Any modal text input (e.g., a future filter-by-tag input).
+
+Concretely, the row list installs its keymap on a focus context
+`WarpDriveRowList`. While focus is in any text input, `Cmd/Ctrl+A` falls
+through to its native "select all text" behavior; `Esc` falls through to
+its native "dismiss/clear input" behavior; `Space` types a space; `Enter`
+submits the input. When the user `Tab`s out of the text input back into the
+row list (or clicks a row), `WarpDriveRowList` regains focus and the
+selection shortcuts resume firing.
+
+Implementation note: this matches Warp's existing keymap-context pattern
+(see verified `app/src/code/editor/` and command-palette focus-context
+guards). The row-list keymap MUST be installed on a context distinct from
+any descendant text-input contexts.
 
 ### B5. Esc clears
 
@@ -103,8 +127,29 @@ Other Bulk Delete behavior:
 - No 5-second undo window (deliberately differs from chat-history bulk delete).
 - Per-item failures are collected and surfaced in a result toast:
   `Deleted X. Y failed.` with a link to view failed items.
-- Recommendation in Open Questions: server-side soft tombstone for 30 days
-  is a separate decision.
+
+#### B7.2. Plan delete recovery model (V1 decision)
+
+The earlier wording deferred Plan recovery to a separate decision. V1
+locks in the following recovery model so user-facing copy and
+implementation semantics are not ambiguous:
+
+- **Plans (and all other Drive item types) are hard-deleted** when bulk
+  Delete is confirmed. There is no in-app undo and no client-visible soft
+  tombstone in V1.
+- The bulk-delete confirmation copy uses the exact phrase **"This cannot
+  be undone."** (already present in B7) — this is now a load-bearing
+  promise that V1 implementations MUST honor. Any future soft-tombstone
+  feature that materially changes recovery MUST also update this copy.
+- **Server-side retention** is out of V1 user-facing scope. If the
+  backend already retains soft tombstones for compliance / admin
+  recovery, that capability is **not** surfaced in any V1 UI, telemetry
+  field, or copy string. (Tracked under Open Questions for V1.5 product
+  decision on whether to expose admin recovery.)
+- This decision is intentionally stricter than chat-history bulk delete
+  (#10457): chat history has a 5-second undo; Drive has none. Users
+  pasting Plan IDs into bug reports / Linear are protected by the
+  confirmation modal alone.
 
 #### B7.1. Hidden-selection invariant (security / safety)
 
@@ -155,10 +200,52 @@ requirements.
 No new user-facing settings. Internal additions:
 
 - `WarpDriveSelection` model holding `{ anchor: Option<RowId>, set: HashSet<RowId> }`.
-- Bulk delete and bulk move route through existing per-item endpoints with a
-  client-side iterator bounded to a sane batch (e.g. 200 per chunk).
-- A server-side batch endpoint may already exist; if so, use it and let the
-  client fall back to serial calls.
+
+### Server-side authorization (REQUIRED for bulk paths)
+
+Both bulk delete and bulk move — whether they land on a new server-side
+batch endpoint or on the existing per-item endpoints in a loop — MUST
+preserve the per-item authorization and ownership checks already enforced
+by the single-item endpoints. Specifically:
+
+- **Per-item auth check.** For each item id in the request, the server
+  re-runs the same ownership / team-membership / role check that the
+  single-item endpoint performs. There is no "trust-the-batch" shortcut.
+- **Partial-deny semantics.** If a subset of ids fail the auth check, the
+  server processes the authorized subset and returns a structured result
+  enumerating `succeeded[]`, `denied[]` (with a non-leaking reason code
+  such as `not_found_or_unauthorized`), and `failed[]` (other errors).
+  The client surfaces denials in the same failed-items toast surface
+  defined in B7.
+- **No id-leak.** The denial reason MUST NOT distinguish "item exists but
+  you don't own it" from "item does not exist" — both collapse to
+  `not_found_or_unauthorized` to avoid leaking the existence of items
+  the caller cannot see.
+- **Cross-team / cross-workspace.** A bulk delete or move request that
+  includes any id outside the caller's accessible scope MUST treat that
+  id as `not_found_or_unauthorized`; the request is **not** rejected
+  wholesale (so a single bad id does not nuke the whole batch).
+- **Audit log.** Each per-item delete or move operation is audited
+  individually as if it had been a single-item call — there is no batch
+  audit row that hides the per-item subjects.
+
+### Client-side batching constraints (REQUIRED)
+
+When the client falls back to per-item calls (no batch endpoint
+available), the client iterator is bounded by ALL of the following — not
+just a chunk size:
+
+| Constraint | V1 limit | Rationale |
+|---|---|---|
+| Total selection size | hard cap **2000** items per bulk action | Beyond this, the UI shows an "Selection too large — narrow the filter and try again." error and refuses the action. Prevents a stray `Cmd+A` over a huge Drive from generating runaway traffic. |
+| Chunk size | **200** ids per request when a batch endpoint is available; **1** per request when falling back to per-item endpoints | Matches existing per-item endpoint shape. |
+| Concurrency (parallelism) | at most **4** concurrent in-flight requests | Caps client-driven server load and keeps UI responsive. |
+| Inter-request rate | at most **20 requests / second** sustained, smoothed via a token-bucket limiter on the client | Protects shared backends and avoids per-user IP throttling. |
+| Backoff | on `429` or `5xx`, exponential backoff with jitter starting at 250ms, max 4 retries per id | Standard polite-client pattern. |
+| Cancellation | the operation is cancellable from the result toast and from `Esc` in the progress indicator; in-flight ids complete; queued ids are dropped | User remains in control. |
+
+A server-side batch endpoint, when available, supersedes the per-item
+loop but MUST still enforce the per-item authorization rules above.
 
 ## Acceptance Criteria
 
@@ -195,6 +282,25 @@ No new user-facing settings. Internal additions:
   filter.
 - A9: Keyboard navigation full path: arrow movement, `Shift+Arrow` extension,
   `Space` toggle, `Enter` open.
+- A_focus_scoping_text_input: While the Drive filter input has focus,
+  `Cmd/Ctrl+A` selects the input text (does NOT select all rows); `Esc`
+  clears the filter input (does NOT clear row selection); `Space` and
+  `Enter` route to the input. After tabbing back to the row list,
+  `Cmd/Ctrl+A` again selects all matching rows.
+- A_server_auth_per_item: A bulk delete request containing 5 ids the
+  caller owns and 2 ids the caller does NOT own returns 5 successes
+  and 2 `not_found_or_unauthorized` denials; the failed-items toast
+  surfaces the 2 denials. The 5 owned items are deleted; the 2
+  non-owned items are unaffected.
+- A_client_chunking_caps: A `Cmd+A` over a Drive containing 2500 items
+  (no filter active) refuses to start the bulk action and surfaces
+  "Selection too large — narrow the filter and try again." A 1500-item
+  selection is accepted; the client issues at most 4 concurrent
+  in-flight requests at any time and at most 20 requests per second
+  sustained.
+- A_plan_no_in_app_undo: After confirming bulk delete on a selection
+  containing Plans, no undo affordance appears anywhere in the Drive UI;
+  the result toast shows `Deleted X. Y failed.` only.
 
 ## Implementation Pointers
 
@@ -262,6 +368,29 @@ Likely change shape:
 - T9: Selection persists after typing into the filter and after clearing it.
 - T10: Keyboard nav full path — arrows, `Shift+Arrow`, `Space`, `Enter`,
   `Cmd+A`, `Esc`.
+- T_focus_scope_filter_input: Selection shortcuts do NOT fire while the
+  filter input owns focus; they DO fire after focus returns to the row
+  list.
+- T_focus_scope_move_picker_input: Selection shortcuts do NOT fire while
+  the Move-to picker's text input owns focus.
+- T_server_auth_partial_deny: Mock server denies a subset of ids;
+  client surfaces `denied[]` items in the failed-items toast under the
+  reason code `not_found_or_unauthorized`; succeeded items are removed
+  from the local view.
+- T_server_auth_no_id_leak: Mock server denial reason is identical for
+  "item exists, caller unauthorized" and "item does not exist"; client
+  treats them identically and shows the same generic copy.
+- T_client_total_cap_blocks: Selection of 2001 items refuses to start
+  the bulk action and surfaces the size-cap toast.
+- T_client_concurrency_cap: With 1000 selected ids and per-item
+  endpoints, at no point are more than 4 requests in flight; sustained
+  rate stays under 20 req/s.
+- T_client_backoff_on_429: A mocked 429 response triggers exponential
+  backoff with jitter starting at 250ms; the id is retried up to 4
+  times before being surfaced as failed.
+- T_plan_hard_delete_no_undo: After confirming bulk delete on a Plan
+  selection, no undo affordance appears; result toast renders the
+  default failure copy only.
 
 ## Open Questions
 
