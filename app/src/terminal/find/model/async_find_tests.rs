@@ -705,6 +705,49 @@ fn test_update_dirty_matches_boundary_spanning_match_keeps_order() {
     );
 }
 
+#[test]
+fn test_update_dirty_matches_boundary_spanning_match_keeps_order_on_prepend() {
+    let mut results = BlockFindResults::default();
+    let block_index = BlockIndex(0);
+    let grid_type = GridType::Output;
+
+    // Seed with a single match on row 11 ending at column 2. A dirty range
+    // ending on row 10 sits entirely before it, so the merge takes the
+    // prepend fast path.
+    results
+        .terminal_matches
+        .insert((block_index, grid_type), vec![make_match_at(11, 0, 2)]);
+
+    // The rescan of dirty row 10 yields a match spanning onto row 11 with a
+    // later end column than the retained match, so a plain prepend would
+    // place it out of ascending order.
+    let spanning_match = AbsoluteMatch {
+        start: AbsolutePoint { row: 10, col: 0 },
+        end: AbsolutePoint { row: 11, col: 4 },
+        is_filtered: false,
+    };
+    results.update_dirty_matches(
+        block_index,
+        grid_type,
+        10..=10,
+        vec![spanning_match.clone()],
+    );
+
+    let stored = results
+        .terminal_matches
+        .get(&(block_index, grid_type))
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(
+        stored.windows(2).all(|w| w[0] <= w[1]),
+        "matches must remain in ascending order after a boundary-spanning prepend: {stored:?}"
+    );
+    assert!(
+        stored.contains(&spanning_match),
+        "the boundary-spanning match must be retained: {stored:?}"
+    );
+}
+
 fn assert_async_focused_order_matches_sync(block_sort_direction: BlockSortDirection) {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
